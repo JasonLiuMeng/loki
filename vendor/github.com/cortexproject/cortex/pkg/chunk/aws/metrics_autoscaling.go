@@ -14,7 +14,7 @@ import (
 	"github.com/weaveworks/common/mtime"
 
 	"github.com/cortexproject/cortex/pkg/chunk"
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 )
 
 const (
@@ -41,17 +41,15 @@ const (
 
 // MetricsAutoScalingConfig holds parameters to configure how it works
 type MetricsAutoScalingConfig struct {
-	URL              string  // URL to contact Prometheus store on
-	TargetQueueLen   int64   // Queue length above which we will scale up capacity
-	ScaleUpFactor    float64 // Scale up capacity by this multiple
-	MinThrottling    float64 // Ignore throttling below this level
-	QueueLengthQuery string  // Promql query to fetch ingester queue length
-	ThrottleQuery    string  // Promql query to fetch throttle rate per table
-	UsageQuery       string  // Promql query to fetch write capacity usage per table
-	ReadUsageQuery   string  // Promql query to fetch read usage per table
-	ReadErrorQuery   string  // Promql query to fetch read errors per table
-
-	deprecatedErrorRateQuery string
+	URL              string  `yaml:"url"`                   // URL to contact Prometheus store on
+	TargetQueueLen   int64   `yaml:"target_queue_length"`   // Queue length above which we will scale up capacity
+	ScaleUpFactor    float64 `yaml:"scale_up_factor"`       // Scale up capacity by this multiple
+	MinThrottling    float64 `yaml:"ignore_throttle_below"` // Ignore throttling below this level
+	QueueLengthQuery string  `yaml:"queue_length_query"`    // Promql query to fetch ingester queue length
+	ThrottleQuery    string  `yaml:"write_throttle_query"`  // Promql query to fetch throttle rate per table
+	UsageQuery       string  `yaml:"write_usage_query"`     // Promql query to fetch write capacity usage per table
+	ReadUsageQuery   string  `yaml:"read_usage_query"`      // Promql query to fetch read usage per table
+	ReadErrorQuery   string  `yaml:"read_error_query"`      // Promql query to fetch read errors per table
 }
 
 // RegisterFlags adds the flags required to config this to the given FlagSet
@@ -65,8 +63,6 @@ func (cfg *MetricsAutoScalingConfig) RegisterFlags(f *flag.FlagSet) {
 	f.StringVar(&cfg.UsageQuery, "metrics.usage-query", defaultUsageQuery, "query to fetch write capacity usage per table")
 	f.StringVar(&cfg.ReadUsageQuery, "metrics.read-usage-query", defaultReadUsageQuery, "query to fetch read capacity usage per table")
 	f.StringVar(&cfg.ReadErrorQuery, "metrics.read-error-query", defaultReadErrorQuery, "query to fetch read errors per table")
-
-	f.StringVar(&cfg.deprecatedErrorRateQuery, "metrics.error-rate-query", "", "DEPRECATED: use -metrics.write-throttle-query instead")
 }
 
 type metricsData struct {
@@ -82,11 +78,7 @@ type metricsData struct {
 	readErrorRates       map[string]float64
 }
 
-func newMetrics(cfg DynamoDBConfig) (*metricsData, error) {
-	if cfg.Metrics.deprecatedErrorRateQuery != "" {
-		level.Warn(util.Logger).Log("msg", "use of deprecated flag -metrics.error-rate-query")
-		cfg.Metrics.ThrottleQuery = cfg.Metrics.deprecatedErrorRateQuery
-	}
+func newMetricsAutoScaling(cfg DynamoDBConfig) (*metricsData, error) {
 	client, err := promApi.NewClient(promApi.Config{Address: cfg.Metrics.URL})
 	if err != nil {
 		return nil, err
@@ -120,7 +112,7 @@ func (m *metricsData) UpdateTable(ctx context.Context, current chunk.TableDesc, 
 		throttleRate := m.throttleRates[expected.Name]
 		usageRate := m.usageRates[expected.Name]
 
-		level.Info(util.Logger).Log("msg", "checking write metrics", "table", current.Name, "queueLengths", fmt.Sprint(m.queueLengths), "throttleRate", throttleRate, "usageRate", usageRate)
+		level.Info(util_log.Logger).Log("msg", "checking write metrics", "table", current.Name, "queueLengths", fmt.Sprint(m.queueLengths), "throttleRate", throttleRate, "usageRate", usageRate)
 
 		switch {
 		case throttleRate < throttleFractionScaledown*float64(current.ProvisionedWrite) &&
@@ -178,7 +170,7 @@ func (m *metricsData) UpdateTable(ctx context.Context, current chunk.TableDesc, 
 		readUsageRate := m.usageReadRates[expected.Name]
 		readErrorRate := m.readErrorRates[expected.Name]
 
-		level.Info(util.Logger).Log("msg", "checking read metrics", "table", current.Name, "errorRate", readErrorRate, "readUsageRate", readUsageRate)
+		level.Info(util_log.Logger).Log("msg", "checking read metrics", "table", current.Name, "errorRate", readErrorRate, "readUsageRate", readUsageRate)
 		// Read Scaling
 		switch {
 		// the table is at low/minimum capacity and it is being used -> scale up
@@ -243,14 +235,14 @@ func scaleDown(tableName string, currentValue, minValue int64, newValue int64, l
 
 	earliest := lastUpdated[tableName].Add(time.Duration(coolDown) * time.Second)
 	if earliest.After(mtime.Now()) {
-		level.Info(util.Logger).Log("msg", "deferring "+msg, "table", tableName, "till", earliest, "op", operation)
+		level.Info(util_log.Logger).Log("msg", "deferring "+msg, "table", tableName, "till", earliest, "op", operation)
 		return currentValue
 	}
 
 	// Reject a change that is less than 20% - AWS rate-limits scale-downs so save
 	// our chances until it makes a bigger difference
 	if newValue > currentValue*4/5 {
-		level.Info(util.Logger).Log("msg", "rejected de minimis "+msg, "table", tableName, "current", currentValue, "proposed", newValue, "op", operation)
+		level.Info(util_log.Logger).Log("msg", "rejected de minimis "+msg, "table", tableName, "current", currentValue, "proposed", newValue, "op", operation)
 		return currentValue
 	}
 
@@ -262,12 +254,12 @@ func scaleDown(tableName string, currentValue, minValue int64, newValue int64, l
 			totalUsage += u
 		}
 		if totalUsage < minUsageForScaledown {
-			level.Info(util.Logger).Log("msg", "rejected low usage "+msg, "table", tableName, "totalUsage", totalUsage, "op", operation)
+			level.Info(util_log.Logger).Log("msg", "rejected low usage "+msg, "table", tableName, "totalUsage", totalUsage, "op", operation)
 			return currentValue
 		}
 	}
 
-	level.Info(util.Logger).Log("msg", msg, "table", tableName, operation, newValue)
+	level.Info(util_log.Logger).Log("msg", msg, "table", tableName, operation, newValue)
 	lastUpdated[tableName] = mtime.Now()
 	return newValue
 }
@@ -278,12 +270,12 @@ func scaleUp(tableName string, currentValue, maxValue int64, newValue int64, las
 	}
 	earliest := lastUpdated[tableName].Add(time.Duration(coolDown) * time.Second)
 	if !earliest.After(mtime.Now()) && newValue > currentValue {
-		level.Info(util.Logger).Log("msg", msg, "table", tableName, operation, newValue)
+		level.Info(util_log.Logger).Log("msg", msg, "table", tableName, operation, newValue)
 		lastUpdated[tableName] = mtime.Now()
 		return newValue
 	}
 
-	level.Info(util.Logger).Log("msg", "deferring "+msg, "table", tableName, "till", earliest)
+	level.Info(util_log.Logger).Log("msg", "deferring "+msg, "table", tableName, "till", earliest)
 	return currentValue
 }
 
@@ -370,7 +362,7 @@ func promQuery(ctx context.Context, promAPI promV1.API, query string, duration, 
 		return nil, err
 	}
 	if wrngs != nil {
-		level.Warn(util.Logger).Log(
+		level.Warn(util_log.Logger).Log(
 			"query", query,
 			"start", queryRange.Start,
 			"end", queryRange.End,

@@ -5,10 +5,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/logproto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/grafana/loki/pkg/iter"
+	loghttp "github.com/grafana/loki/pkg/loghttp/legacy"
+	"github.com/grafana/loki/pkg/logproto"
 )
 
 const (
@@ -34,8 +36,8 @@ func TestTailer(t *testing.T) {
 				actual := flattenStreamsFromResponses(responses)
 
 				assert.Equal(t, []logproto.Stream{
-					*mockStream(1, 1),
-					*mockStream(2, 1),
+					mockStream(1, 1),
+					mockStream(2, 1),
 				}, actual)
 			},
 		},
@@ -51,7 +53,7 @@ func TestTailer(t *testing.T) {
 				actual := flattenStreamsFromResponses(responses)
 
 				assert.Equal(t, []logproto.Stream{
-					*mockStream(1, 1),
+					mockStream(1, 1),
 				}, actual)
 			},
 		},
@@ -67,9 +69,9 @@ func TestTailer(t *testing.T) {
 				actual := flattenStreamsFromResponses(responses)
 
 				assert.Equal(t, []logproto.Stream{
-					*mockStream(1, 1),
-					*mockStream(2, 1),
-					*mockStream(3, 1),
+					mockStream(1, 1),
+					mockStream(2, 1),
+					mockStream(3, 1),
 				}, actual)
 			},
 		},
@@ -167,8 +169,8 @@ func TestTailer(t *testing.T) {
 	}
 }
 
-func readFromTailer(tailer *Tailer, maxEntries int) ([]*TailResponse, error) {
-	responses := make([]*TailResponse, 0)
+func readFromTailer(tailer *Tailer, maxEntries int) ([]*loghttp.TailResponse, error) {
+	responses := make([]*loghttp.TailResponse, 0)
 	entriesCount := 0
 
 	// Ensure we do not wait indefinitely
@@ -234,7 +236,7 @@ func countEntriesInStreams(streams []logproto.Stream) int {
 // to abstract away implementation details in the Tailer when testing for the output
 // regardless how the responses have been generated (ie. multiple entries grouped
 // into the same stream)
-func flattenStreamsFromResponses(responses []*TailResponse) []logproto.Stream {
+func flattenStreamsFromResponses(responses []*loghttp.TailResponse) []logproto.Stream {
 	result := make([]logproto.Stream, 0)
 
 	for _, response := range responses {

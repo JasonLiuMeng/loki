@@ -1,14 +1,19 @@
 package logql
 
 import (
-	"github.com/grafana/loki/pkg/iter"
+	"sync"
+
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
+	promql_parser "github.com/prometheus/prometheus/promql/parser"
+
+	"github.com/grafana/loki/pkg/iter"
 )
 
 // RangeVectorAggregator aggregates samples for a given range of samples.
 // It receives the current milliseconds timestamp and the list of point within
 // the range.
-type RangeVectorAggregator func(int64, []promql.Point) float64
+type RangeVectorAggregator func([]promql.Point) float64
 
 // RangeVectorIterator iterates through a range of samples.
 // To fetch the current vector use `At` with a `RangeVectorAggregator`.
@@ -16,28 +21,37 @@ type RangeVectorIterator interface {
 	Next() bool
 	At(aggregator RangeVectorAggregator) (int64, promql.Vector)
 	Close() error
+	Error() error
 }
 
 type rangeVectorIterator struct {
-	iter                         iter.PeekingEntryIterator
-	selRange, step, end, current int64
-	window                       map[string]*promql.Series
+	iter                                 iter.PeekingSampleIterator
+	selRange, step, end, current, offset int64
+	window                               map[string]*promql.Series
+	metrics                              map[string]labels.Labels
+	at                                   []promql.Sample
 }
 
 func newRangeVectorIterator(
-	it iter.EntryIterator,
-	selRange, step, start, end int64) *rangeVectorIterator {
+	it iter.PeekingSampleIterator,
+	selRange, step, start, end, offset int64) *rangeVectorIterator {
 	// forces at least one step.
 	if step == 0 {
 		step = 1
 	}
+	if offset != 0 {
+		start = start - offset
+		end = end - offset
+	}
 	return &rangeVectorIterator{
-		iter:     iter.NewPeekingIterator(it),
+		iter:     it,
 		step:     step,
 		end:      end,
 		selRange: selRange,
 		current:  start - step, // first loop iteration will set it to start
+		offset:   offset,
 		window:   map[string]*promql.Series{},
+		metrics:  map[string]labels.Labels{},
 	}
 }
 
@@ -48,7 +62,7 @@ func (r *rangeVectorIterator) Next() bool {
 		return false
 	}
 	rangeEnd := r.current
-	rangeStart := r.current - r.selRange
+	rangeStart := rangeEnd - r.selRange
 	// load samples
 	r.popBack(rangeStart)
 	r.load(rangeStart, rangeEnd)
@@ -59,34 +73,44 @@ func (r *rangeVectorIterator) Close() error {
 	return r.iter.Close()
 }
 
+func (r *rangeVectorIterator) Error() error {
+	return r.iter.Error()
+}
+
 // popBack removes all entries out of the current window from the back.
 func (r *rangeVectorIterator) popBack(newStart int64) {
 	// possible improvement: if there is no overlap we can just remove all.
 	for fp := range r.window {
 		lastPoint := 0
+		remove := false
 		for i, p := range r.window[fp].Points {
 			if p.T <= newStart {
 				lastPoint = i
+				remove = true
 				continue
 			}
 			break
 		}
-		r.window[fp].Points = r.window[fp].Points[lastPoint+1:]
+		if remove {
+			r.window[fp].Points = r.window[fp].Points[lastPoint+1:]
+		}
 		if len(r.window[fp].Points) == 0 {
+			s := r.window[fp]
 			delete(r.window, fp)
+			putSeries(s)
 		}
 	}
 }
 
 // load the next sample range window.
 func (r *rangeVectorIterator) load(start, end int64) {
-	for lbs, entry, hasNext := r.iter.Peek(); hasNext; lbs, entry, hasNext = r.iter.Peek() {
-		if entry.Timestamp.UnixNano() > end {
+	for lbs, sample, hasNext := r.iter.Peek(); hasNext; lbs, sample, hasNext = r.iter.Peek() {
+		if sample.Timestamp > end {
 			// not consuming the iterator as this belong to another range.
 			return
 		}
 		// the lower bound of the range is not inclusive
-		if entry.Timestamp.UnixNano() <= start {
+		if sample.Timestamp <= start {
 			_ = r.iter.Next()
 			continue
 		}
@@ -95,37 +119,62 @@ func (r *rangeVectorIterator) load(start, end int64) {
 		var ok bool
 		series, ok = r.window[lbs]
 		if !ok {
-			series = &promql.Series{
-				Points: []promql.Point{},
+			var metric labels.Labels
+			if metric, ok = r.metrics[lbs]; !ok {
+				var err error
+				metric, err = promql_parser.ParseMetric(lbs)
+				if err != nil {
+					_ = r.iter.Next()
+					continue
+				}
+				r.metrics[lbs] = metric
 			}
+
+			series = getSeries()
+			series.Metric = metric
 			r.window[lbs] = series
 		}
-		series.Points = append(series.Points, promql.Point{
-			T: entry.Timestamp.UnixNano(),
-			V: 1,
-		})
+		p := promql.Point{
+			T: sample.Timestamp,
+			V: sample.Value,
+		}
+		series.Points = append(series.Points, p)
 		_ = r.iter.Next()
 	}
 }
 
 func (r *rangeVectorIterator) At(aggregator RangeVectorAggregator) (int64, promql.Vector) {
-	result := make([]promql.Sample, 0, len(r.window))
+	if r.at == nil {
+		r.at = make([]promql.Sample, 0, len(r.window))
+	}
+	r.at = r.at[:0]
 	// convert ts from nano to milli seconds as the iterator work with nanoseconds
-	ts := r.current / 1e+6
-	for lbs, series := range r.window {
-		labels, err := promql.ParseMetric(lbs)
-		if err != nil {
-			continue
-		}
-
-		result = append(result, promql.Sample{
+	ts := r.current/1e+6 + r.offset/1e+6
+	for _, series := range r.window {
+		r.at = append(r.at, promql.Sample{
 			Point: promql.Point{
-				V: aggregator(ts, series.Points),
+				V: aggregator(series.Points),
 				T: ts,
 			},
-			Metric: labels,
+			Metric: series.Metric,
 		})
-
 	}
-	return ts, result
+	return ts, r.at
+}
+
+var seriesPool sync.Pool
+
+func getSeries() *promql.Series {
+	if r := seriesPool.Get(); r != nil {
+		s := r.(*promql.Series)
+		s.Points = s.Points[:0]
+		return s
+	}
+	return &promql.Series{
+		Points: make([]promql.Point, 0, 1024),
+	}
+}
+
+func putSeries(s *promql.Series) {
+	seriesPool.Put(s)
 }

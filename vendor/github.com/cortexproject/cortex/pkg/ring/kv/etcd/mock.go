@@ -10,8 +10,8 @@ import (
 
 	"github.com/cortexproject/cortex/pkg/util/flagext"
 
-	"go.etcd.io/etcd/embed"
-	"go.etcd.io/etcd/etcdserver/api/v3client"
+	"go.etcd.io/etcd/server/v3/embed"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/v3client"
 
 	"github.com/cortexproject/cortex/pkg/ring/kv/codec"
 )
@@ -27,6 +27,7 @@ func Mock(codec codec.Codec) (*Client, io.Closer, error) {
 	}
 
 	cfg := embed.NewConfig()
+	cfg.Logger = "zap"
 	cfg.Dir = dir
 	lpurl, _ := url.Parse("http://localhost:0")
 	lcurl, _ := url.Parse("http://localhost:0")

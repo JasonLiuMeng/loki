@@ -1,16 +1,16 @@
 {
   _images+:: {
-    promtail: 'grafana/promtail:v0.3.0',
+    promtail: 'grafana/promtail:2.2.0',
   },
 
   _config+:: {
     prometheus_insecure_skip_verify: false,
     promtail_config: {
-      clients:[{
+      clients: [{
         username:: '',
         password:: '',
         scheme:: 'https',
-        hostname:: 'logs-us-west1.grafana.net',
+        hostname:: error 'must define a valid hostname',
         external_labels: {},
       }],
       container_root_path: '/var/lib/docker',

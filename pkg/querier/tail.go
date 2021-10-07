@@ -1,15 +1,17 @@
 package querier
 
 import (
-	"fmt"
+	"context"
 	"sync"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/util"
+	util_log "github.com/cortexproject/cortex/pkg/util/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/logproto"
 	"github.com/pkg/errors"
+
+	"github.com/grafana/loki/pkg/iter"
+	loghttp "github.com/grafana/loki/pkg/loghttp/legacy"
+	"github.com/grafana/loki/pkg/logproto"
 )
 
 const (
@@ -29,17 +31,6 @@ const (
 	maxDroppedEntriesPerTailResponse = 1000
 )
 
-type droppedEntry struct {
-	Timestamp time.Time
-	Labels    string
-}
-
-// TailResponse holds response sent by tailer
-type TailResponse struct {
-	Streams        []logproto.Stream `json:"streams"`
-	DroppedEntries []droppedEntry    `json:"dropped_entries"`
-}
-
 // Tailer manages complete lifecycle of a tail request
 type Tailer struct {
 	// openStreamIterator is for streams already open
@@ -56,7 +47,7 @@ type Tailer struct {
 
 	stopped         bool
 	delayFor        time.Duration
-	responseChan    chan *TailResponse
+	responseChan    chan *loghttp.TailResponse
 	closeErrChan    chan error
 	tailMaxDuration time.Duration
 
@@ -83,18 +74,18 @@ func (t *Tailer) loop() {
 	tailMaxDurationTicker := time.NewTicker(t.tailMaxDuration)
 	defer tailMaxDurationTicker.Stop()
 
-	droppedEntries := make([]droppedEntry, 0)
+	droppedEntries := make([]loghttp.DroppedEntry, 0)
 
 	for !t.stopped {
 		select {
 		case <-checkConnectionTicker.C:
 			// Try to reconnect dropped ingesters and connect to new ingesters
 			if err := t.checkIngesterConnections(); err != nil {
-				level.Error(util.Logger).Log("msg", "Error reconnecting to disconnected ingesters", "err", err)
+				level.Error(util_log.Logger).Log("msg", "Error reconnecting to disconnected ingesters", "err", err)
 			}
 		case <-tailMaxDurationTicker.C:
 			if err := t.close(); err != nil {
-				level.Error(util.Logger).Log("msg", "Error closing Tailer", "err", err)
+				level.Error(util_log.Logger).Log("msg", "Error closing Tailer", "err", err)
 			}
 			t.closeErrChan <- errors.New("reached tail max duration limit")
 			return
@@ -103,7 +94,7 @@ func (t *Tailer) loop() {
 
 		// Read as much entries as we can (up to the max allowed) and populate the
 		// tail response we'll send over the response channel
-		tailResponse := new(TailResponse)
+		tailResponse := new(loghttp.TailResponse)
 		entriesCount := 0
 
 		for ; entriesCount < maxEntriesPerTailResponse && t.next(); entriesCount++ {
@@ -136,12 +127,12 @@ func (t *Tailer) loop() {
 			if numClients == 0 {
 				// All the connections to ingesters are dropped, try reconnecting or return error
 				if err := t.checkIngesterConnections(); err != nil {
-					level.Error(util.Logger).Log("Error reconnecting to ingesters", fmt.Sprintf("%v", err))
+					level.Error(util_log.Logger).Log("msg", "Error reconnecting to ingesters", "err", err)
 				} else {
 					continue
 				}
 				if err := t.close(); err != nil {
-					level.Error(util.Logger).Log("Error closing Tailer", fmt.Sprintf("%v", err))
+					level.Error(util_log.Logger).Log("msg", "Error closing Tailer", "err", err)
 				}
 				t.closeErrChan <- errors.New("all ingesters closed the connection")
 				return
@@ -160,7 +151,7 @@ func (t *Tailer) loop() {
 		select {
 		case t.responseChan <- tailResponse:
 			if len(droppedEntries) > 0 {
-				droppedEntries = make([]droppedEntry, 0)
+				droppedEntries = make([]loghttp.DroppedEntry, 0)
 			}
 		default:
 			droppedEntries = dropEntries(droppedEntries, tailResponse.Streams)
@@ -206,16 +197,21 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier_
 	var resp *logproto.TailResponse
 	var err error
 	defer t.dropTailClient(addr)
+
+	logger := util_log.WithContext(querierTailClient.Context(), util_log.Logger)
 	for {
 		if t.stopped {
 			if err := querierTailClient.CloseSend(); err != nil {
-				level.Error(util.Logger).Log("Error closing gprc tail client", fmt.Sprintf("%v", err))
+				level.Error(logger).Log("msg", "Error closing grpc tail client", "err", err)
 			}
 			break
 		}
 		resp, err = querierTailClient.Recv()
 		if err != nil {
-			level.Error(util.Logger).Log("Error receiving response from gprc tail client", fmt.Sprintf("%v", err))
+			// We don't want to log error when its due to stopping the tail request
+			if !t.stopped {
+				level.Error(logger).Log("msg", "Error receiving response from grpc tail client", "err", err)
+			}
 			break
 		}
 		t.pushTailResponseFromIngester(resp)
@@ -227,7 +223,7 @@ func (t *Tailer) pushTailResponseFromIngester(resp *logproto.TailResponse) {
 	t.streamMtx.Lock()
 	defer t.streamMtx.Unlock()
 
-	t.openStreamIterator.Push(iter.NewStreamIterator(resp.Stream))
+	t.openStreamIterator.Push(iter.NewStreamIterator(*resp.Stream))
 }
 
 // finds oldest entry by peeking at open stream iterator.
@@ -259,7 +255,7 @@ func (t *Tailer) isResponseChanBlocked() bool {
 	return len(t.responseChan) == cap(t.responseChan)
 }
 
-func (t *Tailer) getResponseChan() <-chan *TailResponse {
+func (t *Tailer) getResponseChan() <-chan *loghttp.TailResponse {
 	return t.responseChan
 }
 
@@ -276,10 +272,10 @@ func newTailer(
 	waitEntryThrottle time.Duration,
 ) *Tailer {
 	t := Tailer{
-		openStreamIterator:        iter.NewHeapIterator([]iter.EntryIterator{historicEntries}, logproto.FORWARD),
+		openStreamIterator:        iter.NewHeapIterator(context.Background(), []iter.EntryIterator{historicEntries}, logproto.FORWARD),
 		querierTailClients:        querierTailClients,
 		delayFor:                  delayFor,
-		responseChan:              make(chan *TailResponse, maxBufferedTailResponses),
+		responseChan:              make(chan *loghttp.TailResponse, maxBufferedTailResponses),
 		closeErrChan:              make(chan error),
 		tailDisconnectedIngesters: tailDisconnectedIngesters,
 		tailMaxDuration:           tailMaxDuration,
@@ -291,15 +287,15 @@ func newTailer(
 	return &t
 }
 
-func dropEntry(droppedEntries []droppedEntry, timestamp time.Time, labels string) []droppedEntry {
+func dropEntry(droppedEntries []loghttp.DroppedEntry, timestamp time.Time, labels string) []loghttp.DroppedEntry {
 	if len(droppedEntries) >= maxDroppedEntriesPerTailResponse {
 		return droppedEntries
 	}
 
-	return append(droppedEntries, droppedEntry{timestamp, labels})
+	return append(droppedEntries, loghttp.DroppedEntry{Timestamp: timestamp, Labels: labels})
 }
 
-func dropEntries(droppedEntries []droppedEntry, streams []logproto.Stream) []droppedEntry {
+func dropEntries(droppedEntries []loghttp.DroppedEntry, streams []logproto.Stream) []loghttp.DroppedEntry {
 	for _, stream := range streams {
 		for _, entry := range stream.Entries {
 			droppedEntries = dropEntry(droppedEntries, entry.Timestamp, entry.Line)

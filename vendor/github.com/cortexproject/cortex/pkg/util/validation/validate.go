@@ -2,40 +2,54 @@ package validation
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/cortexproject/cortex/pkg/ingester/client"
-	"github.com/cortexproject/cortex/pkg/util/extract"
+	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/weaveworks/common/httpgrpc"
+
+	"github.com/cortexproject/cortex/pkg/cortexpb"
+	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/cortexproject/cortex/pkg/util/extract"
 )
 
 const (
 	discardReasonLabel = "reason"
 
-	errMissingMetricName = "sample missing metric name"
-	errInvalidMetricName = "sample invalid metric name: %.200q"
-	errInvalidLabel      = "sample invalid label: %.200q metric %.200q"
-	errLabelNameTooLong  = "label name too long: %.200q metric %.200q"
-	errLabelValueTooLong = "label value too long: %.200q metric %.200q"
-	errTooManyLabels     = "sample for '%s' has %d label names; limit %d"
-	errTooOld            = "sample for '%s' has timestamp too old: %d"
-	errTooNew            = "sample for '%s' has timestamp too new: %d"
+	errMetadataMissingMetricName = "metadata missing metric name"
+	errMetadataTooLong           = "metadata '%s' value too long: %.200q metric %.200q"
 
-	// ErrQueryTooLong is used in chunk store and query frontend.
-	ErrQueryTooLong = "invalid query, length > limit (%s > %s)"
+	typeMetricName = "METRIC_NAME"
+	typeHelp       = "HELP"
+	typeUnit       = "UNIT"
 
+	metricNameTooLong = "metric_name_too_long"
+	helpTooLong       = "help_too_long"
+	unitTooLong       = "unit_too_long"
+
+	// ErrQueryTooLong is used in chunk store, querier and query frontend.
+	ErrQueryTooLong = "the query time range exceeds the limit (query length: %s, limit: %s)"
+
+	missingMetricName       = "missing_metric_name"
+	invalidMetricName       = "metric_name_invalid"
 	greaterThanMaxSampleAge = "greater_than_max_sample_age"
 	maxLabelNamesPerSeries  = "max_label_names_per_series"
 	tooFarInFuture          = "too_far_in_future"
 	invalidLabel            = "label_invalid"
 	labelNameTooLong        = "label_name_too_long"
+	duplicateLabelNames     = "duplicate_label_names"
+	labelsNotSorted         = "labels_not_sorted"
 	labelValueTooLong       = "label_value_too_long"
 
 	// RateLimited is one of the values for the reason to discard samples.
 	// Declared here to avoid duplication in ingester and distributor.
 	RateLimited = "rate_limited"
+
+	// Too many HA clusters is one of the reasons for discarding samples.
+	TooManyHAClusters = "too_many_ha_clusters"
 )
 
 // DiscardedSamples is a metric of the number of discarded samples, by reason.
@@ -47,8 +61,18 @@ var DiscardedSamples = prometheus.NewCounterVec(
 	[]string{discardReasonLabel, "user"},
 )
 
+// DiscardedMetadata is a metric of the number of discarded metadata, by reason.
+var DiscardedMetadata = prometheus.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "cortex_discarded_metadata_total",
+		Help: "The total number of metadata that were discarded.",
+	},
+	[]string{discardReasonLabel, "user"},
+)
+
 func init() {
 	prometheus.MustRegister(DiscardedSamples)
+	prometheus.MustRegister(DiscardedMetadata)
 }
 
 // SampleValidationConfig helps with getting required config to validate sample.
@@ -59,15 +83,15 @@ type SampleValidationConfig interface {
 }
 
 // ValidateSample returns an err if the sample is invalid.
-func ValidateSample(cfg SampleValidationConfig, userID string, metricName string, s client.Sample) error {
+func ValidateSample(cfg SampleValidationConfig, userID string, metricName string, s cortexpb.Sample) ValidationError {
 	if cfg.RejectOldSamples(userID) && model.Time(s.TimestampMs) < model.Now().Add(-cfg.RejectOldSamplesMaxAge(userID)) {
 		DiscardedSamples.WithLabelValues(greaterThanMaxSampleAge, userID).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, errTooOld, metricName, model.Time(s.TimestampMs))
+		return newSampleTimestampTooOldError(metricName, s.TimestampMs)
 	}
 
 	if model.Time(s.TimestampMs) > model.Now().Add(cfg.CreationGracePeriod(userID)) {
 		DiscardedSamples.WithLabelValues(tooFarInFuture, userID).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, errTooNew, metricName, model.Time(s.TimestampMs))
+		return newSampleTimestampTooNewError(metricName, s.TimestampMs)
 	}
 
 	return nil
@@ -82,47 +106,100 @@ type LabelValidationConfig interface {
 }
 
 // ValidateLabels returns an err if the labels are invalid.
-func ValidateLabels(cfg LabelValidationConfig, userID string, ls []client.LabelAdapter) error {
-	metricName, err := extract.MetricNameFromLabelAdapters(ls)
+func ValidateLabels(cfg LabelValidationConfig, userID string, ls []cortexpb.LabelAdapter, skipLabelNameValidation bool) ValidationError {
 	if cfg.EnforceMetricName(userID) {
+		metricName, err := extract.MetricNameFromLabelAdapters(ls)
 		if err != nil {
-			return httpgrpc.Errorf(http.StatusBadRequest, errMissingMetricName)
+			DiscardedSamples.WithLabelValues(missingMetricName, userID).Inc()
+			return newNoMetricNameError()
 		}
 
 		if !model.IsValidMetricName(model.LabelValue(metricName)) {
-			return httpgrpc.Errorf(http.StatusBadRequest, errInvalidMetricName, metricName)
+			DiscardedSamples.WithLabelValues(invalidMetricName, userID).Inc()
+			return newInvalidMetricNameError(metricName)
 		}
 	}
 
 	numLabelNames := len(ls)
 	if numLabelNames > cfg.MaxLabelNamesPerSeries(userID) {
 		DiscardedSamples.WithLabelValues(maxLabelNamesPerSeries, userID).Inc()
-		return httpgrpc.Errorf(http.StatusBadRequest, errTooManyLabels, client.FromLabelAdaptersToMetric(ls).String(), numLabelNames, cfg.MaxLabelNamesPerSeries(userID))
+		return newTooManyLabelsError(ls, cfg.MaxLabelNamesPerSeries(userID))
 	}
 
 	maxLabelNameLength := cfg.MaxLabelNameLength(userID)
 	maxLabelValueLength := cfg.MaxLabelValueLength(userID)
+	lastLabelName := ""
 	for _, l := range ls {
-		var errTemplate string
-		var reason string
-		var cause interface{}
-		if !model.LabelName(l.Name).IsValid() {
-			reason = invalidLabel
-			errTemplate = errInvalidLabel
-			cause = l.Name
+		if !skipLabelNameValidation && !model.LabelName(l.Name).IsValid() {
+			DiscardedSamples.WithLabelValues(invalidLabel, userID).Inc()
+			return newInvalidLabelError(ls, l.Name)
 		} else if len(l.Name) > maxLabelNameLength {
-			reason = labelNameTooLong
-			errTemplate = errLabelNameTooLong
-			cause = l.Name
+			DiscardedSamples.WithLabelValues(labelNameTooLong, userID).Inc()
+			return newLabelNameTooLongError(ls, l.Name)
 		} else if len(l.Value) > maxLabelValueLength {
-			reason = labelValueTooLong
-			errTemplate = errLabelValueTooLong
-			cause = l.Value
+			DiscardedSamples.WithLabelValues(labelValueTooLong, userID).Inc()
+			return newLabelValueTooLongError(ls, l.Value)
+		} else if cmp := strings.Compare(lastLabelName, l.Name); cmp >= 0 {
+			if cmp == 0 {
+				DiscardedSamples.WithLabelValues(duplicateLabelNames, userID).Inc()
+				return newDuplicatedLabelError(ls, l.Name)
+			}
+
+			DiscardedSamples.WithLabelValues(labelsNotSorted, userID).Inc()
+			return newLabelsNotSortedError(ls, l.Name)
 		}
-		if errTemplate != "" {
-			DiscardedSamples.WithLabelValues(reason, userID).Inc()
-			return httpgrpc.Errorf(http.StatusBadRequest, errTemplate, cause, client.FromLabelAdaptersToMetric(ls).String())
-		}
+
+		lastLabelName = l.Name
 	}
 	return nil
+}
+
+// MetadataValidationConfig helps with getting required config to validate metadata.
+type MetadataValidationConfig interface {
+	EnforceMetadataMetricName(userID string) bool
+	MaxMetadataLength(userID string) int
+}
+
+// ValidateMetadata returns an err if a metric metadata is invalid.
+func ValidateMetadata(cfg MetadataValidationConfig, userID string, metadata *cortexpb.MetricMetadata) error {
+	if cfg.EnforceMetadataMetricName(userID) && metadata.GetMetricFamilyName() == "" {
+		DiscardedMetadata.WithLabelValues(missingMetricName, userID).Inc()
+		return httpgrpc.Errorf(http.StatusBadRequest, errMetadataMissingMetricName)
+	}
+
+	maxMetadataValueLength := cfg.MaxMetadataLength(userID)
+	var reason string
+	var cause string
+	var metadataType string
+	if len(metadata.GetMetricFamilyName()) > maxMetadataValueLength {
+		metadataType = typeMetricName
+		reason = metricNameTooLong
+		cause = metadata.GetMetricFamilyName()
+	} else if len(metadata.Help) > maxMetadataValueLength {
+		metadataType = typeHelp
+		reason = helpTooLong
+		cause = metadata.Help
+	} else if len(metadata.Unit) > maxMetadataValueLength {
+		metadataType = typeUnit
+		reason = unitTooLong
+		cause = metadata.Unit
+	}
+
+	if reason != "" {
+		DiscardedMetadata.WithLabelValues(reason, userID).Inc()
+		return httpgrpc.Errorf(http.StatusBadRequest, errMetadataTooLong, metadataType, cause, metadata.GetMetricFamilyName())
+	}
+
+	return nil
+}
+
+func DeletePerUserValidationMetrics(userID string, log log.Logger) {
+	filter := map[string]string{"user": userID}
+
+	if err := util.DeleteMatchingLabels(DiscardedSamples, filter); err != nil {
+		level.Warn(log).Log("msg", "failed to remove cortex_discarded_samples_total metric for user", "user", userID, "err", err)
+	}
+	if err := util.DeleteMatchingLabels(DiscardedMetadata, filter); err != nil {
+		level.Warn(log).Log("msg", "failed to remove cortex_discarded_metadata_total metric for user", "user", userID, "err", err)
+	}
 }

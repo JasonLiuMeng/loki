@@ -1,4 +1,4 @@
-local apps = ['loki', 'loki-canary', 'promtail'];
+local apps = ['loki', 'loki-canary', 'logcli'];
 local archs = ['amd64', 'arm64', 'arm'];
 
 local build_image_version = std.extVar('__build-image-version');
@@ -9,6 +9,7 @@ local condition(verb) = {
       [verb]:
         [
           'refs/heads/master',
+          'refs/heads/k??',
           'refs/tags/v*',
         ],
     },
@@ -43,7 +44,19 @@ local docker(arch, app) = {
   },
 };
 
-local multiarch_image(arch) = pipeline('docker-' + arch) {
+local clients_docker(arch, app) = {
+  name: '%s-image' % if $.settings.dry_run then 'build-' + app else 'publish-' + app,
+  image: 'plugins/docker',
+  settings: {
+    repo: 'grafana/%s' % app,
+    dockerfile: 'clients/cmd/%s/Dockerfile' % app,
+    username: { from_secret: 'docker_username' },
+    password: { from_secret: 'docker_password' },
+    dry_run: false,
+  },
+};
+
+local arch_image(arch, tags='') = {
   platform: {
     os: 'linux',
     arch: arch,
@@ -55,13 +68,131 @@ local multiarch_image(arch) = pipeline('docker-' + arch) {
       'apk add --no-cache bash git',
       'git fetch origin --tags',
       'echo $(./tools/image-tag)-%s > .tags' % arch,
+    ] + if tags != '' then ['echo ",%s" >> .tags' % tags] else [],
+  }],
+};
+
+local promtail_win() = pipeline('promtail-windows') {
+  platform: {
+    os: 'windows',
+    arch: 'amd64',
+    version: '1809',
+  },
+  steps: [{
+    name: 'test',
+    image: 'golang:windowsservercore-1809',
+    commands: [
+      'go test .\\clients\\pkg\\promtail\\targets\\windows\\... -v',
     ],
-  }] + [
+  }],
+};
+
+local fluentbit() = pipeline('fluent-bit-amd64') + arch_image('amd64', 'latest,master') {
+  steps+: [
+    // dry run for everything that is not tag or master
+    clients_docker('amd64', 'fluent-bit') {
+      depends_on: ['image-tag'],
+      when: condition('exclude').tagMaster,
+      settings+: {
+        dry_run: true,
+        repo: 'grafana/fluent-bit-plugin-loki',
+      },
+    },
+  ] + [
+    // publish for tag or master
+    clients_docker('amd64', 'fluent-bit') {
+      depends_on: ['image-tag'],
+      when: condition('include').tagMaster,
+      settings+: {
+        repo: 'grafana/fluent-bit-plugin-loki',
+      },
+    },
+  ],
+  depends_on: ['check'],
+};
+
+local fluentd() = pipeline('fluentd-amd64') + arch_image('amd64', 'latest,master') {
+  steps+: [
+    // dry run for everything that is not tag or master
+    clients_docker('amd64', 'fluentd') {
+      depends_on: ['image-tag'],
+      when: condition('exclude').tagMaster,
+      settings+: {
+        dry_run: true,
+        repo: 'grafana/fluent-plugin-loki',
+      },
+    },
+  ] + [
+    // publish for tag or master
+    clients_docker('amd64', 'fluentd') {
+      depends_on: ['image-tag'],
+      when: condition('include').tagMaster,
+      settings+: {
+        repo: 'grafana/fluent-plugin-loki',
+      },
+    },
+  ],
+  depends_on: ['check'],
+};
+
+local logstash() = pipeline('logstash-amd64') + arch_image('amd64', 'latest,master') {
+  steps+: [
+    // dry run for everything that is not tag or master
+    clients_docker('amd64', 'logstash') {
+      depends_on: ['image-tag'],
+      when: condition('exclude').tagMaster,
+      settings+: {
+        dry_run: true,
+        repo: 'grafana/logstash-output-loki',
+      },
+    },
+  ] + [
+    // publish for tag or master
+    clients_docker('amd64', 'logstash') {
+      depends_on: ['image-tag'],
+      when: condition('include').tagMaster,
+      settings+: {
+        repo: 'grafana/logstash-output-loki',
+      },
+    },
+  ],
+  depends_on: ['check'],
+};
+
+local promtail(arch) = pipeline('promtail-' + arch) + arch_image(arch) {
+steps+: [
+    // dry run for everything that is not tag or master
+    clients_docker(arch, 'promtail') {
+      depends_on: ['image-tag'],
+      when: condition('exclude').tagMaster,
+      settings+: {
+        dry_run: true,
+        build_args: ['TOUCH_PROTOS=1'],
+      },
+    }
+  ] + [
+    // publish for tag or master
+    clients_docker(arch, 'promtail') {
+      depends_on: ['image-tag'],
+      when: condition('include').tagMaster,
+      settings+: {
+        build_args: ['TOUCH_PROTOS=1'],
+      },
+    }
+  ],
+  depends_on: ['check'],
+};
+
+local multiarch_image(arch) = pipeline('docker-' + arch) + arch_image(arch) {
+  steps+: [
     // dry run for everything that is not tag or master
     docker(arch, app) {
       depends_on: ['image-tag'],
       when: condition('exclude').tagMaster,
-      settings+: { dry_run: true },
+      settings+: {
+        dry_run: true,
+        build_args: ['TOUCH_PROTOS=1'],
+      },
     }
     for app in apps
   ] + [
@@ -69,6 +200,9 @@ local multiarch_image(arch) = pipeline('docker-' + arch) {
     docker(arch, app) {
       depends_on: ['image-tag'],
       when: condition('include').tagMaster,
+      settings+: {
+        build_args: ['TOUCH_PROTOS=1'],
+      },
     }
     for app in apps
   ],
@@ -76,8 +210,8 @@ local multiarch_image(arch) = pipeline('docker-' + arch) {
 };
 
 local manifest(apps) = pipeline('manifest') {
-  steps: [
-    {
+  steps: std.foldl(
+    function(acc, app) acc + [{
       name: 'manifest-' + app,
       image: 'plugins/manifest',
       settings: {
@@ -85,58 +219,95 @@ local manifest(apps) = pipeline('manifest') {
         // as it is unused in spec mode. See docker-manifest.tmpl
         target: app,
         spec: '.drone/docker-manifest.tmpl',
-        ignore_missing: true,
+        ignore_missing: false,
         username: { from_secret: 'docker_username' },
         password: { from_secret: 'docker_password' },
       },
-      depends_on: ['clone'],
-    }
-    for app in apps
-  ],
+      depends_on: ['clone'] + (
+        // Depend on the previous app, if any.
+        if std.length(acc) > 0
+        then [acc[std.length(acc) - 1].name]
+        else []
+      ),
+    }],
+    apps,
+    [],
+  ),
   depends_on: [
     'docker-%s' % arch
+    for arch in archs
+  ] + [
+    'promtail-%s' % arch
     for arch in archs
   ],
 };
 
-local drone = [
+[
   pipeline('check') {
     workspace: {
-      base: "/go/src",
-      path: "github.com/grafana/loki"
+      base: '/src',
+      path: 'loki',
     },
     steps: [
       make('test', container=false) { depends_on: ['clone'] },
       make('lint', container=false) { depends_on: ['clone'] },
       make('check-generated-files', container=false) { depends_on: ['clone'] },
+      make('check-mod', container=false) { depends_on: ['clone', 'test', 'lint'] },
     ],
   },
 ] + [
   multiarch_image(arch)
   for arch in archs
 ] + [
+  promtail(arch) + (
+    // When we're building Promtail for ARM, we want to use Dockerfile.arm32 to fix
+    // a problem with the published Drone image. See Dockerfile.arm32 for more
+    // information.
+    //
+    // This is really really hacky and a better more permanent solution will be to use
+    // buildkit.
+    if arch == 'arm'
+    then {
+      steps: [
+        step + (
+          if std.objectHas(step, 'settings') && step.settings.dockerfile == 'clients/cmd/promtail/Dockerfile'
+          then {
+            settings+: {
+              dockerfile: 'clients/cmd/promtail/Dockerfile.arm32',
+            },
+          }
+          else {}
+        )
+        for step in super.steps
+      ],
+    }
+    else {}
+  )
+  for arch in archs
+] +[
+  fluentbit(),
+  fluentd(),
+  logstash(),
+] + [
   manifest(['promtail', 'loki', 'loki-canary']) {
     trigger: condition('include').tagMaster,
   },
 ] + [
-  pipeline("deploy") {
+  pipeline('deploy') {
     trigger: condition('include').tagMaster,
-    depends_on: ["manifest"],
+    depends_on: ['manifest'],
     steps: [
       {
-        name: "trigger",
+        name: 'trigger',
         image: 'grafana/loki-build-image:%s' % build_image_version,
         environment: {
-          CIRCLE_TOKEN: {from_secret: "circle_token"}
+          CIRCLE_TOKEN: { from_secret: 'circle_token' },
         },
         commands: [
-          'curl -s --header "Content-Type: application/json" --data "{\\"build_parameters\\": {\\"CIRCLE_JOB\\": \\"deploy\\", \\"IMAGE_NAMES\\": \\"$(make print-images)\\"}}" --request POST https://circleci.com/api/v1.1/project/github/raintank/deployment_tools/tree/master?circle-token=$CIRCLE_TOKEN'
-        ]
-      }
+          './tools/deploy.sh',
+        ],
+        depends_on: ['clone'],
+      },
     ],
-  }
-];
-
-{
-  drone: std.manifestYamlStream(drone),
-}
+  },
+] + [promtail_win()]
